@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.2.14
+
+- Fixed the commit message showing twice in the expanded detail view -
+  it was fetching `%B` (subject + body) when the subject is already
+  shown as the row's own title, duplicating it for the common
+  single-line-message case. Now fetches `%b` (body only), and the body
+  section is omitted entirely when there isn't one.
+- Replaced the "Copy hash" text button with a compact copy icon (⧉,
+  briefly becomes ✓ after copying).
+
+## 0.2.13
+
+- Expanded commit detail now shows the `git show --stat` summary line
+  (files changed, insertions/deletions) with insertions/deletions colored
+  the same way as the file-status letters, and a "Copy hash" button next
+  to the short hash - copies the full hash via `vscode.env.clipboard`
+  (extension-host clipboard API, not the browser one, so it works
+  reliably regardless of the webview's own clipboard permissions).
+
+## 0.2.12
+
+- Commit dots now use real branch-lane topology instead of one flat
+  color: each commit's actual graph lane is computed by shelling out to
+  `git log --graph` (parsing which column its `*` marker lands in) rather
+  than reimplementing lane assignment, then mapped to one of six colors
+  via VS Code's own chart theme tokens, cycling per lane. Lane numbers
+  are recomputed from the start of history on every page load (not just
+  the current page's `--skip` window) since `--graph` combined with
+  `--skip` alone reassigns lanes from scratch for that narrower slice -
+  verified this keeps already-shown commits' colors stable as more
+  pages load via infinite scroll.
+
 ## 0.2.11
 
 - History tab: each commit row now shows a small leading dot - filled for

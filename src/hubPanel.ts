@@ -302,6 +302,9 @@ export class HubPanel {
       case "viewDiff":
         await this.viewDiff(message.hash as string, message.file as ChangedFile);
         break;
+      case "copyToClipboard":
+        await vscode.env.clipboard.writeText(message.text as string);
+        break;
       case "chatSend":
         await this.handleChatSend(message.text as string);
         break;
@@ -571,15 +574,21 @@ function getHubHtml(webview: vscode.Webview): string {
     height: 8px;
     border-radius: 50%;
     margin-top: 5px;
-    background: var(--vscode-focusBorder, #007acc);
+    box-sizing: border-box;
+    background: var(--dot-color, var(--vscode-focusBorder, #007acc));
   }
   .commit-dot.merge {
     background: none;
-    border: 2px solid var(--vscode-focusBorder, #007acc);
-    box-sizing: border-box;
-    width: 8px;
-    height: 8px;
+    border: 2px solid var(--dot-color, var(--vscode-focusBorder, #007acc));
   }
+  /* One color per branch lane (cycling), matching VS Code's own git-graph
+     bullet colors via its chart-color theme tokens. */
+  .commit-dot.lane-0 { --dot-color: var(--vscode-charts-blue, #3794ff); }
+  .commit-dot.lane-1 { --dot-color: var(--vscode-charts-purple, #b180d7); }
+  .commit-dot.lane-2 { --dot-color: var(--vscode-charts-orange, #d18616); }
+  .commit-dot.lane-3 { --dot-color: var(--vscode-charts-green, #89d185); }
+  .commit-dot.lane-4 { --dot-color: var(--vscode-charts-red, #f14c4c); }
+  .commit-dot.lane-5 { --dot-color: var(--vscode-charts-yellow, #cca700); }
   .commit-row-main { min-width: 0; }
   .commit-subject { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
   .commit-meta { font-size: 0.85em; opacity: 0.75; }
@@ -596,6 +605,19 @@ function getHubHtml(webview: vscode.Webview): string {
   .commit-badge.modified { color: var(--vscode-gitDecoration-modifiedResourceForeground, #e2c08d); }
   .commit-badge.deleted { color: var(--vscode-gitDecoration-deletedResourceForeground, #f14c4c); }
   .commit-detail { padding: 8px 8px 8px 20px; white-space: pre-wrap; font-size: 0.9em; }
+  .commit-hash-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .copy-hash-btn {
+    height: 22px;
+    width: 22px;
+    padding: 0;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .commit-stat-line { margin-bottom: 6px; opacity: 0.9; }
+  .stat-insertions { color: var(--vscode-gitDecoration-addedResourceForeground, #4caf50); }
+  .stat-deletions { color: var(--vscode-gitDecoration-deletedResourceForeground, #f14c4c); }
   .file-row { display: flex; justify-content: space-between; padding: 2px 0; }
   .status-letter {
     display: inline-block;
@@ -1056,7 +1078,8 @@ function getHubHtml(webview: vscode.Webview): string {
       lead.className = "commit-row-lead";
 
       var dot = document.createElement("span");
-      dot.className = "commit-dot" + (commit.isMerge ? " merge" : "");
+      var lane = (commit.lane || 0) % 6;
+      dot.className = "commit-dot lane-" + lane + (commit.isMerge ? " merge" : "");
       lead.appendChild(dot);
 
       var main = document.createElement("div");
@@ -1124,6 +1147,17 @@ function getHubHtml(webview: vscode.Webview): string {
     });
   }
 
+  function parseStatSummary(raw) {
+    var filesMatch = raw.match(/(\d+) files? changed/);
+    var insMatch = raw.match(/(\d+) insertion/);
+    var delMatch = raw.match(/(\d+) deletion/);
+    return {
+      files: filesMatch ? filesMatch[1] : null,
+      insertions: insMatch ? insMatch[1] : null,
+      deletions: delMatch ? delMatch[1] : null,
+    };
+  }
+
   function renderDetail(detail) {
     commitDetails[detail.hash] = detail;
     var rows = commitList.querySelectorAll(".commit-row");
@@ -1133,9 +1167,54 @@ function getHubHtml(webview: vscode.Webview): string {
       var detailEl = row.querySelector(".commit-detail");
       detailEl.innerHTML = "";
 
-      var body = document.createElement("div");
-      body.textContent = detail.body;
-      detailEl.appendChild(body);
+      if (detail.body && detail.body.trim()) {
+        var body = document.createElement("div");
+        body.textContent = detail.body;
+        detailEl.appendChild(body);
+      }
+
+      var hashRow = document.createElement("div");
+      hashRow.className = "commit-hash-row";
+      var hashCode = document.createElement("code");
+      hashCode.className = "inline-code";
+      hashCode.textContent = detail.hash.slice(0, 7);
+      var copyBtn = document.createElement("button");
+      copyBtn.type = "button";
+      copyBtn.className = "copy-hash-btn";
+      copyBtn.title = "Copy hash";
+      copyBtn.textContent = "⧉";
+      copyBtn.addEventListener("click", function () {
+        vscode.postMessage({ type: "copyToClipboard", text: detail.hash });
+        copyBtn.textContent = "✓";
+        setTimeout(function () { copyBtn.textContent = "⧉"; }, 1200);
+      });
+      hashRow.appendChild(hashCode);
+      hashRow.appendChild(copyBtn);
+      detailEl.appendChild(hashRow);
+
+      var stat = parseStatSummary(detail.statSummary || "");
+      if (stat.files || stat.insertions || stat.deletions) {
+        var statLine = document.createElement("div");
+        statLine.className = "commit-stat-line";
+        if (stat.files) {
+          var filesSpan = document.createElement("span");
+          filesSpan.textContent = stat.files + (stat.files === "1" ? " file changed" : " files changed");
+          statLine.appendChild(filesSpan);
+        }
+        if (stat.insertions) {
+          var insSpan = document.createElement("span");
+          insSpan.className = "stat-insertions";
+          insSpan.textContent = (stat.files ? ", " : "") + stat.insertions + " insertions(+)";
+          statLine.appendChild(insSpan);
+        }
+        if (stat.deletions) {
+          var delSpan = document.createElement("span");
+          delSpan.className = "stat-deletions";
+          delSpan.textContent = (stat.files || stat.insertions ? ", " : "") + stat.deletions + " deletions(-)";
+          statLine.appendChild(delSpan);
+        }
+        detailEl.appendChild(statLine);
+      }
 
       detail.files.forEach(function (file) {
         var fr = document.createElement("div");

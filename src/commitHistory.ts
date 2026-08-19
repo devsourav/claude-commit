@@ -13,6 +13,7 @@ export interface CommitSummary {
   date: string;
   subject: string;
   isMerge: boolean;
+  lane: number;
   fileStats: CommitFileStats;
 }
 
@@ -97,16 +98,18 @@ export interface ListCommitsOptions {
   until?: string;
 }
 
-// The filter portion (branch/date/author/message) shared between the main
-// listing query and the separate file-stats query below, so both stay in
-// sync without duplicating the flag logic.
+// The filter predicate (branch/date/author/message) shared between the
+// main listing query, the file-stats query, and the lane query below, so
+// all three stay in sync without duplicating the flag logic. Deliberately
+// excludes --skip/--max-count - callers add pagination on top, since the
+// lane query needs a different pagination shape than the others (see
+// fetchLanes for why).
 function buildFilterArgs(options: ListCommitsOptions): string[] {
-  const { skip = 0, limit = 50, grep, branch, author, since, until } = options;
+  const { grep, branch, author, since, until } = options;
   const args = ["log"];
   if (branch) {
     args.push(branch);
   }
-  args.push(`--skip=${skip}`, `--max-count=${limit + 1}`);
   if (grep) {
     args.push(`--grep=${grep}`);
   }
@@ -135,14 +138,15 @@ export async function listCommits(
   options: ListCommitsOptions = {}
 ): Promise<{ commits: CommitSummary[]; hasMore: boolean }> {
   const { skip = 0, limit = 50, grep, branch } = options;
-  const filterArgs = buildFilterArgs(options);
+  const predicateArgs = buildFilterArgs(options);
+  const pagedArgs = [...predicateArgs, `--skip=${skip}`, `--max-count=${limit + 1}`];
   const args = [
-    ...filterArgs,
+    ...pagedArgs,
     `--pretty=format:%H${FIELD_SEP}%h${FIELD_SEP}%an${FIELD_SEP}%ad${FIELD_SEP}%P${FIELD_SEP}%s${RECORD_SEP}`,
     "--date=short",
   ];
 
-  let commits: Omit<CommitSummary, "fileStats">[] = [];
+  let commits: Omit<CommitSummary, "fileStats" | "lane">[] = [];
   let hasMore = false;
   try {
     const out = await runGit(cwd, args);
@@ -162,7 +166,7 @@ export async function listCommits(
   // The search box also doubles as a commit-hash lookup: if the term looks
   // like a (possibly abbreviated) hash, resolve it directly and splice it
   // into the first page, since `--grep` only ever matches message text.
-  let hashMatch: Omit<CommitSummary, "fileStats"> | undefined;
+  let hashMatch: Omit<CommitSummary, "fileStats" | "lane"> | undefined;
   const term = grep?.trim();
   if (term && skip === 0 && HASH_LIKE.test(term)) {
     const resolved = await tryResolveCommit(cwd, term);
@@ -174,18 +178,65 @@ export async function listCommits(
     }
   }
 
-  const statsMap = await fetchFileStats(cwd, filterArgs);
+  const [statsMap, lanes] = await Promise.all([
+    fetchFileStats(cwd, pagedArgs),
+    fetchLanes(cwd, predicateArgs, skip + limit),
+  ]);
   let withStats: CommitSummary[] = commits.map((c) => ({
     ...c,
     fileStats: statsMap.get(c.hash) ?? EMPTY_STATS,
+    lane: lanes.get(c.hash) ?? 0,
   }));
 
   if (hashMatch) {
     const detail = await getCommitDetail(cwd, hashMatch.hash);
-    withStats = [{ ...hashMatch, fileStats: tallyChangedFiles(detail.files) }, ...withStats].slice(0, limit);
+    withStats = [
+      { ...hashMatch, fileStats: tallyChangedFiles(detail.files), lane: lanes.get(hashMatch.hash) ?? 0 },
+      ...withStats,
+    ].slice(0, limit);
   }
 
   return { commits: withStats, hasMore };
+}
+
+// Branch-lane index per commit, matching VS Code's own git-graph bullet
+// style (a distinct color per branch lane) - computed by shelling out to
+// `git log --graph` and reading the column each commit's `*` marker lands
+// in, rather than reimplementing graph-lane assignment ourselves.
+//
+// Deliberately re-runs from the very start of history (skip=0) up through
+// the current page every time, rather than just the current page's own
+// --skip window: git's --graph lane numbering is only self-consistent
+// within whatever single invocation produced it, so combining --graph with
+// --skip on its own reassigns lanes from scratch for that narrower window
+// and can flip which lane an already-shown commit was in. Recomputing from
+// the top each time is more work per page but keeps lanes stable as more
+// pages load (verified: the same prefix of commits gets identical lanes
+// regardless of how far --max-count extends).
+async function fetchLanes(cwd: string, predicateArgs: string[], throughCount: number): Promise<Map<string, number>> {
+  if (throughCount <= 0) {
+    return new Map();
+  }
+  const args = [...predicateArgs, `--max-count=${throughCount}`, "--graph", "--pretty=format:%H"];
+  let out: string;
+  try {
+    out = await runGit(cwd, args);
+  } catch {
+    return new Map();
+  }
+
+  const lanes = new Map<string, number>();
+  out.split("\n").forEach((line) => {
+    const starIndex = line.indexOf("*");
+    if (starIndex === -1) {
+      return; // pure graph connector line (|, /, \), no commit on it
+    }
+    const hash = line.slice(starIndex + 1).trim();
+    if (hash) {
+      lanes.set(hash, Math.floor(starIndex / 2));
+    }
+  });
+  return lanes;
 }
 
 // Runs the same filters as the main listing query but with `--name-status`
@@ -249,7 +300,7 @@ const HASH_LIKE = /^[0-9a-fA-F]{4,64}$/;
 async function tryResolveCommit(
   cwd: string,
   ref: string
-): Promise<Omit<CommitSummary, "fileStats"> | undefined> {
+): Promise<Omit<CommitSummary, "fileStats" | "lane"> | undefined> {
   try {
     const out = await runGit(cwd, [
       "log",
@@ -279,8 +330,11 @@ async function isAncestorOf(cwd: string, hash: string, branch: string): Promise<
 }
 
 export async function getCommitDetail(cwd: string, hash: string): Promise<CommitDetail> {
+  // %b (body only) rather than %B (subject + body) - the subject is
+  // already shown separately as the commit-row title, so using %B would
+  // duplicate it here for the common case of a single-line commit message.
   const [body, statSummary, nameStatus] = await Promise.all([
-    runGit(cwd, ["show", "--format=%B", "--no-patch", hash]),
+    runGit(cwd, ["show", "--format=%b", "--no-patch", hash]),
     runGit(cwd, ["show", "--format=", "--stat", hash]),
     runGit(cwd, ["show", "--format=", "--name-status", hash]),
   ]);
