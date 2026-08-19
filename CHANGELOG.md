@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.2.11
+
+- History tab: each commit row now shows a small leading dot - filled for
+  a regular commit, a hollow ring for a merge commit - matching VS Code's
+  own git graph bullet style, without drawing the connecting branch
+  lines.
+
+## 0.2.10
+
+- Fixed the sidebar collapse/expand button overlapping the rightmost chat
+  bubble: it was absolutely-positioned floating over the chat log, which
+  could collide with right-aligned user messages. Replaced with a single
+  always-present slim toggle handle that's a real flex sibling of the
+  chat log and sidebar, so it reserves its own space and can't overlap
+  anything.
+
+## 0.2.9
+
+- Chat now supports multiple saved conversations per repository (like
+  ChatGPT/Claude.ai), not just one continuous thread: a collapsible
+  sidebar on the right lists all past conversations (title + last-updated
+  time), searchable by title, click one to reopen it, "+ New chat" starts
+  a fresh thread. Each conversation keeps its own Claude Code CLI session
+  id for continuity. Existing single-thread history from 0.2.8 is
+  migrated in automatically as each repo's first conversation.
+
+## 0.2.8
+
+- Chat history now persists per repository across panel reopens and VS
+  Code restarts (last 200 turns, plus the Claude Code CLI session id for
+  continuity) - reopening the panel or switching back to a repo picks the
+  conversation up where it left off instead of starting empty every time.
+
 ## 0.2.7
 
 - The Repository selector only ever listed repos already open in the

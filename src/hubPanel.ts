@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { randomUUID } from "crypto";
 import { listCommits, listBranches, listAuthors, getCommitDetail, ChangedFile } from "./commitHistory";
 import { toGitRevisionUri } from "./gitContentProvider";
 import { askChat, ChatSession } from "./chat";
@@ -6,10 +7,41 @@ import { GitApi } from "./gitApi";
 
 const PAGE_SIZE = 50;
 const EXTRA_REPOS_STATE_KEY = "claudeCommit.browsedRepositories";
+const LEGACY_CHAT_HISTORY_STATE_KEY = "claudeCommit.chatHistory";
+const CONVERSATIONS_STATE_KEY = "claudeCommit.chatConversations";
+const MAX_PERSISTED_CHAT_MESSAGES = 200;
 
 interface WebviewMessage {
   type: string;
   [key: string]: unknown;
+}
+
+interface ChatTurn {
+  role: string;
+  text: string;
+}
+
+// Pre-0.2.9 shape: one continuous thread per repo. Read (but never written)
+// for one-time migration into the multi-conversation model below.
+interface LegacyPersistedChatState {
+  sessionId?: string;
+  messages: ChatTurn[];
+}
+
+interface ChatConversation {
+  id: string;
+  title: string;
+  updatedAt: string;
+  sessionId?: string;
+  messages: ChatTurn[];
+}
+
+function deriveConversationTitle(firstMessage: string): string {
+  const oneLine = firstMessage.replace(/\s+/g, " ").trim();
+  if (!oneLine) {
+    return "New conversation";
+  }
+  return oneLine.length > 60 ? oneLine.slice(0, 57) + "..." : oneLine;
 }
 
 // Singleton webview panel: History + Chat tabs over the repo at `cwd`.
@@ -24,6 +56,8 @@ export class HubPanel {
   private readonly gitApi: GitApi;
   private cwd: string;
   private chatSession: ChatSession = {};
+  private conversations: ChatConversation[] = [];
+  private activeConversationId: string | undefined;
   private readonly disposables: vscode.Disposable[] = [];
   // Repositories opened via "Browse for repository..." rather than being
   // part of the current workspace - gitApi.repositories only ever reflects
@@ -73,6 +107,7 @@ export class HubPanel {
     this.loadCommits(true);
     this.loadBranches();
     this.loadAuthors();
+    this.restoreChatState(cwd);
   }
 
   private dispose() {
@@ -94,17 +129,107 @@ export class HubPanel {
   private switchRepository(cwd: string) {
     this.cwd = cwd;
     this.historyBranch = undefined;
-    this.chatSession = {};
     this.reloadHistory();
     this.loadRepositories();
     this.loadBranches();
     this.loadAuthors();
     this.post({ type: "chatClear" });
+    this.restoreChatState(cwd);
+  }
+
+  // Each repository keeps its own list of saved conversations (and each
+  // conversation its own Claude Code CLI session id), persisted across
+  // panel reopens and VS Code restarts - switching repos, or reopening
+  // the panel on the same one, resumes the most recent conversation for
+  // that repo instead of starting over every time.
+  private restoreChatState(cwd: string) {
+    this.conversations = this.loadConversations(cwd);
+    if (this.conversations.length > 0) {
+      this.activateConversation(this.mostRecentConversationId());
+    } else {
+      this.startNewConversation();
+    }
+  }
+
+  private mostRecentConversationId(): string {
+    return [...this.conversations].sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1))[0].id;
+  }
+
+  private activateConversation(id: string) {
+    const convo = this.conversations.find((c) => c.id === id);
+    if (!convo) {
+      return;
+    }
+    this.activeConversationId = id;
+    this.chatSession = { sessionId: convo.sessionId };
+    this.post({ type: "chatClear" });
+    if (convo.messages.length > 0) {
+      this.post({ type: "chatHistory", messages: convo.messages });
+    } else {
+      this.post({
+        type: "chatMessage",
+        role: "system",
+        text: `Starting a new conversation about ${repoName(this.cwd)}.`,
+      });
+    }
+    this.postConversationList();
+  }
+
+  // A "new chat" doesn't create a saved conversation until the first
+  // message is actually sent, so clicking it repeatedly without typing
+  // anything doesn't clutter the sidebar with empty entries.
+  private startNewConversation() {
+    this.activeConversationId = undefined;
+    this.chatSession = {};
+    this.post({ type: "chatClear" });
     this.post({
       type: "chatMessage",
       role: "system",
-      text: `Switched to ${repoName(cwd)} - starting a new conversation.`,
+      text: `Starting a new conversation about ${repoName(this.cwd)}.`,
     });
+    this.postConversationList();
+  }
+
+  private postConversationList() {
+    const sorted = [...this.conversations].sort((a, b) => (a.updatedAt < b.updatedAt ? 1 : -1));
+    this.post({
+      type: "chatConversations",
+      conversations: sorted.map((c) => ({ id: c.id, title: c.title, updatedAt: c.updatedAt })),
+      activeId: this.activeConversationId,
+    });
+  }
+
+  private loadConversations(cwd: string): ChatConversation[] {
+    const all = this.context.globalState.get<Record<string, ChatConversation[]>>(CONVERSATIONS_STATE_KEY, {});
+    if (all[cwd]) {
+      return all[cwd];
+    }
+
+    // One-time migration from the pre-0.2.9 single-thread-per-repo model.
+    const legacyAll = this.context.globalState.get<Record<string, LegacyPersistedChatState>>(
+      LEGACY_CHAT_HISTORY_STATE_KEY,
+      {}
+    );
+    const legacy = legacyAll[cwd];
+    if (legacy && legacy.messages.length > 0) {
+      const firstUserMessage = legacy.messages.find((m) => m.role === "user")?.text ?? "";
+      return [
+        {
+          id: randomUUID(),
+          title: deriveConversationTitle(firstUserMessage),
+          updatedAt: new Date().toISOString(),
+          sessionId: legacy.sessionId,
+          messages: legacy.messages,
+        },
+      ];
+    }
+    return [];
+  }
+
+  private async saveConversations() {
+    const all = this.context.globalState.get<Record<string, ChatConversation[]>>(CONVERSATIONS_STATE_KEY, {});
+    all[this.cwd] = this.conversations;
+    await this.context.globalState.update(CONVERSATIONS_STATE_KEY, all);
   }
 
   private loadRepositories() {
@@ -180,6 +305,12 @@ export class HubPanel {
       case "chatSend":
         await this.handleChatSend(message.text as string);
         break;
+      case "newChat":
+        this.startNewConversation();
+        break;
+      case "switchConversation":
+        this.activateConversation(message.id as string);
+        break;
     }
   }
 
@@ -251,6 +382,20 @@ export class HubPanel {
     // than the single-shot commit-message call, so give it more room.
     const timeoutMs = Math.max(timeoutSeconds * 2, 120) * 1000;
 
+    let convo = this.conversations.find((c) => c.id === this.activeConversationId);
+    if (!convo) {
+      convo = {
+        id: randomUUID(),
+        title: deriveConversationTitle(text),
+        updatedAt: new Date().toISOString(),
+        messages: [],
+      };
+      this.conversations.unshift(convo);
+      this.activeConversationId = convo.id;
+    }
+    convo.messages.push({ role: "user", text });
+    convo.messages = convo.messages.slice(-MAX_PERSISTED_CHAT_MESSAGES);
+
     this.post({ type: "chatBusy", busy: true });
     try {
       const answer = await askChat({
@@ -262,14 +407,18 @@ export class HubPanel {
         session: this.chatSession,
       });
       this.post({ type: "chatMessage", role: "assistant", text: answer.text });
+      convo.messages.push({ role: "assistant", text: answer.text });
     } catch (err) {
-      this.post({
-        type: "chatMessage",
-        role: "system",
-        text: err instanceof Error ? err.message : String(err),
-      });
+      const message = err instanceof Error ? err.message : String(err);
+      this.post({ type: "chatMessage", role: "system", text: message });
+      convo.messages.push({ role: "system", text: message });
     } finally {
+      convo.sessionId = this.chatSession.sessionId;
+      convo.updatedAt = new Date().toISOString();
+      convo.messages = convo.messages.slice(-MAX_PERSISTED_CHAT_MESSAGES);
       this.post({ type: "chatBusy", busy: false });
+      await this.saveConversations();
+      this.postConversationList();
     }
   }
 
@@ -415,6 +564,22 @@ function getHubHtml(webview: vscode.Webview): string {
   }
   .commit-row:hover { background: var(--vscode-list-hoverBackground); }
   .commit-row-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+  .commit-row-lead { display: flex; align-items: flex-start; gap: 8px; min-width: 0; }
+  .commit-dot {
+    flex-shrink: 0;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-top: 5px;
+    background: var(--vscode-focusBorder, #007acc);
+  }
+  .commit-dot.merge {
+    background: none;
+    border: 2px solid var(--vscode-focusBorder, #007acc);
+    box-sizing: border-box;
+    width: 8px;
+    height: 8px;
+  }
   .commit-row-main { min-width: 0; }
   .commit-subject { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
   .commit-meta { font-size: 0.85em; opacity: 0.75; }
@@ -444,6 +609,55 @@ function getHubHtml(webview: vscode.Webview): string {
   .status-letter.modified { color: var(--vscode-gitDecoration-modifiedResourceForeground, #e2c08d); }
   .status-letter.deleted { color: var(--vscode-gitDecoration-deletedResourceForeground, #f14c4c); }
   #loadMoreIndicator { margin-top: 10px; opacity: 0.75; text-align: center; display: none; }
+  .chat-body { display: flex; flex-direction: row; flex: 1; min-height: 0; gap: 10px; }
+  .chat-main { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+  .sidebar-toggle {
+    flex-shrink: 0;
+    align-self: stretch;
+    width: 18px;
+    padding: 0;
+  }
+  .chat-sidebar {
+    width: 240px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    border-left: 1px solid var(--vscode-panel-border);
+    padding-left: 10px;
+  }
+  .chat-sidebar-header {
+    margin-bottom: 8px;
+    font-weight: 600;
+  }
+  #newChatBtn { margin-bottom: 8px; }
+  #conversationSearch { margin-bottom: 8px; }
+  #conversationList {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    overflow-y: auto;
+    flex: 1;
+    min-height: 0;
+  }
+  .conversation-item {
+    padding: 6px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    margin-bottom: 2px;
+  }
+  .conversation-item:hover { background: var(--vscode-list-hoverBackground); }
+  .conversation-item.active {
+    background: var(--vscode-list-activeSelectionBackground);
+    color: var(--vscode-list-activeSelectionForeground);
+  }
+  .conversation-title {
+    font-size: 0.9em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .conversation-date { font-size: 0.75em; opacity: 0.7; margin-top: 2px; }
   #chatLog {
     display: flex;
     flex-direction: column;
@@ -531,10 +745,23 @@ function getHubHtml(webview: vscode.Webview): string {
   </div>
 
   <div id="chat" class="tab-panel">
-    <div id="chatLog"></div>
-    <div class="chat-input-row">
-      <textarea id="chatInput" rows="1" placeholder="Ask about this repo's history... (Enter to send, Shift+Enter for a new line)"></textarea>
-      <button id="chatSendBtn">Send</button>
+    <div class="chat-body">
+      <div class="chat-main">
+        <div id="chatLog"></div>
+        <div class="chat-input-row">
+          <textarea id="chatInput" rows="1" placeholder="Ask about this repo's history... (Enter to send, Shift+Enter for a new line)"></textarea>
+          <button id="chatSendBtn">Send</button>
+        </div>
+      </div>
+      <button id="sidebarToggleBtn" class="sidebar-toggle" title="Toggle conversation history">&raquo;</button>
+      <div class="chat-sidebar" id="chatSidebar">
+        <div class="chat-sidebar-header">
+          <span>Conversations</span>
+        </div>
+        <button id="newChatBtn">+ New chat</button>
+        <input id="conversationSearch" type="text" placeholder="Search conversations...">
+        <ul id="conversationList"></ul>
+      </div>
     </div>
   </div>
 
@@ -825,6 +1052,13 @@ function getHubHtml(webview: vscode.Webview): string {
       var header = document.createElement("div");
       header.className = "commit-row-header";
 
+      var lead = document.createElement("div");
+      lead.className = "commit-row-lead";
+
+      var dot = document.createElement("span");
+      dot.className = "commit-dot" + (commit.isMerge ? " merge" : "");
+      lead.appendChild(dot);
+
       var main = document.createElement("div");
       main.className = "commit-row-main";
       var subject = document.createElement("div");
@@ -835,7 +1069,8 @@ function getHubHtml(webview: vscode.Webview): string {
       meta.textContent = commit.shortHash + " - " + commit.author + " - " + commit.date;
       main.appendChild(subject);
       main.appendChild(meta);
-      header.appendChild(main);
+      lead.appendChild(main);
+      header.appendChild(lead);
 
       var stats = commit.fileStats || { added: 0, modified: 0, deleted: 0 };
       if (stats.added || stats.modified || stats.deleted) {
@@ -937,6 +1172,63 @@ function getHubHtml(webview: vscode.Webview): string {
   var chatLog = document.getElementById("chatLog");
   var chatInput = document.getElementById("chatInput");
   var chatSendBtn = document.getElementById("chatSendBtn");
+  var chatSidebar = document.getElementById("chatSidebar");
+  var conversationList = document.getElementById("conversationList");
+  var conversationSearch = document.getElementById("conversationSearch");
+  var newChatBtn = document.getElementById("newChatBtn");
+  var sidebarToggleBtn = document.getElementById("sidebarToggleBtn");
+  var allConversations = [];
+  var activeConversationId = null;
+  var sidebarCollapsed = false;
+
+  newChatBtn.addEventListener("click", function () {
+    vscode.postMessage({ type: "newChat" });
+  });
+  sidebarToggleBtn.addEventListener("click", function () {
+    sidebarCollapsed = !sidebarCollapsed;
+    chatSidebar.style.display = sidebarCollapsed ? "none" : "flex";
+    sidebarToggleBtn.textContent = sidebarCollapsed ? "«" : "»";
+    sidebarToggleBtn.title = sidebarCollapsed ? "Show conversation history" : "Collapse";
+  });
+  conversationSearch.addEventListener("input", renderConversationList);
+
+  function renderConversationList() {
+    var term = conversationSearch.value.trim().toLowerCase();
+    var filtered = term
+      ? allConversations.filter(function (c) { return c.title.toLowerCase().indexOf(term) !== -1; })
+      : allConversations;
+
+    conversationList.innerHTML = "";
+    if (filtered.length === 0) {
+      var empty = document.createElement("li");
+      empty.className = "empty";
+      empty.textContent = term ? "No matching conversations." : "No conversations yet.";
+      conversationList.appendChild(empty);
+      return;
+    }
+    filtered.forEach(function (convo) {
+      var li = document.createElement("li");
+      li.className = "conversation-item" + (convo.id === activeConversationId ? " active" : "");
+      var title = document.createElement("div");
+      title.className = "conversation-title";
+      title.textContent = convo.title;
+      var date = document.createElement("div");
+      date.className = "conversation-date";
+      date.textContent = new Date(convo.updatedAt).toLocaleString();
+      li.appendChild(title);
+      li.appendChild(date);
+      li.addEventListener("click", function () {
+        vscode.postMessage({ type: "switchConversation", id: convo.id });
+      });
+      conversationList.appendChild(li);
+    });
+  }
+
+  function renderConversations(conversations, activeId) {
+    allConversations = conversations;
+    activeConversationId = activeId;
+    renderConversationList();
+  }
 
   // Auto-scroll to the newest message, but back off the moment the user
   // scrolls on their own (they're reading history), and only resume once
@@ -986,7 +1278,7 @@ function getHubHtml(webview: vscode.Webview): string {
     return html;
   }
 
-  function appendBubble(role, text) {
+  function appendBubble(role, text, skipScroll) {
     var safeText = text == null ? "" : String(text);
     var b = document.createElement("div");
     b.className = "bubble " + role;
@@ -1002,7 +1294,12 @@ function getHubHtml(webview: vscode.Webview): string {
       }
     }
     chatLog.appendChild(b);
-    if (chatAutoScroll) { scrollChatToBottom(); }
+    if (!skipScroll && chatAutoScroll) { scrollChatToBottom(); }
+  }
+
+  function renderChatHistory(messages) {
+    messages.forEach(function (m) { appendBubble(m.role, m.text, true); });
+    scrollChatToBottom();
   }
 
   function showThinking() {
@@ -1075,6 +1372,12 @@ function getHubHtml(webview: vscode.Webview): string {
         break;
       case "chatClear":
         chatLog.innerHTML = "";
+        break;
+      case "chatHistory":
+        renderChatHistory(msg.messages);
+        break;
+      case "chatConversations":
+        renderConversations(msg.conversations, msg.activeId);
         break;
       case "chatMessage":
         hideThinking();

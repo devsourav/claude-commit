@@ -2,7 +2,7 @@
   "name": "claude-commit",
   "displayName": "Claude Commit",
   "description": "Generate commit messages, browse commit history, and chat about your repo's history - all powered by the Claude Code CLI.",
-  "version": "0.2.7",
+  "version": "0.2.11",
   "publisher": "devsourav",
   "icon": "icon.png",
   "license": "MIT",

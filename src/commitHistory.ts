@@ -12,7 +12,12 @@ export interface CommitSummary {
   author: string;
   date: string;
   subject: string;
+  isMerge: boolean;
   fileStats: CommitFileStats;
+}
+
+function countParents(parentHashes: string): number {
+  return parentHashes.trim().split(/\s+/).filter(Boolean).length;
 }
 
 export interface ChangedFile {
@@ -133,7 +138,7 @@ export async function listCommits(
   const filterArgs = buildFilterArgs(options);
   const args = [
     ...filterArgs,
-    `--pretty=format:%H${FIELD_SEP}%h${FIELD_SEP}%an${FIELD_SEP}%ad${FIELD_SEP}%s${RECORD_SEP}`,
+    `--pretty=format:%H${FIELD_SEP}%h${FIELD_SEP}%an${FIELD_SEP}%ad${FIELD_SEP}%P${FIELD_SEP}%s${RECORD_SEP}`,
     "--date=short",
   ];
 
@@ -147,8 +152,8 @@ export async function listCommits(
       .filter(Boolean);
     hasMore = records.length > limit;
     commits = records.slice(0, limit).map((record) => {
-      const [hash, shortHash, author, date, subject] = record.split(FIELD_SEP);
-      return { hash, shortHash, author, date, subject };
+      const [hash, shortHash, author, date, parents, subject] = record.split(FIELD_SEP);
+      return { hash, shortHash, author, date, subject, isMerge: countParents(parents) > 1 };
     });
   } catch {
     // No commits yet, or not inside a git repo with any history.
@@ -250,15 +255,15 @@ async function tryResolveCommit(
       "log",
       "-1",
       ref,
-      `--pretty=format:%H${FIELD_SEP}%h${FIELD_SEP}%an${FIELD_SEP}%ad${FIELD_SEP}%s`,
+      `--pretty=format:%H${FIELD_SEP}%h${FIELD_SEP}%an${FIELD_SEP}%ad${FIELD_SEP}%P${FIELD_SEP}%s`,
       "--date=short",
     ]);
     const trimmed = out.trim();
     if (!trimmed) {
       return undefined;
     }
-    const [hash, shortHash, author, date, subject] = trimmed.split(FIELD_SEP);
-    return { hash, shortHash, author, date, subject };
+    const [hash, shortHash, author, date, parents, subject] = trimmed.split(FIELD_SEP);
+    return { hash, shortHash, author, date, subject, isMerge: countParents(parents) > 1 };
   } catch {
     return undefined;
   }
