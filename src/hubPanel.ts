@@ -5,6 +5,7 @@ import { askChat, ChatSession } from "./chat";
 import { GitApi } from "./gitApi";
 
 const PAGE_SIZE = 50;
+const EXTRA_REPOS_STATE_KEY = "claudeCommit.browsedRepositories";
 
 interface WebviewMessage {
   type: string;
@@ -19,10 +20,16 @@ export class HubPanel {
   private static current: HubPanel | undefined;
 
   private readonly panel: vscode.WebviewPanel;
+  private readonly context: vscode.ExtensionContext;
   private readonly gitApi: GitApi;
   private cwd: string;
   private chatSession: ChatSession = {};
   private readonly disposables: vscode.Disposable[] = [];
+  // Repositories opened via "Browse for repository..." rather than being
+  // part of the current workspace - gitApi.repositories only ever reflects
+  // workspace-open repos, so this is how we support any other repo on
+  // disk. Persisted so they're still offered after reopening the panel.
+  private extraRepoPaths: string[];
   private historySkip = 0;
   private historyGrep: string | undefined;
   private historyBranch: string | undefined;
@@ -46,13 +53,15 @@ export class HubPanel {
       vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true }
     );
-    HubPanel.current = new HubPanel(panel, gitApi, cwd);
+    HubPanel.current = new HubPanel(panel, context, gitApi, cwd);
   }
 
-  private constructor(panel: vscode.WebviewPanel, gitApi: GitApi, cwd: string) {
+  private constructor(panel: vscode.WebviewPanel, context: vscode.ExtensionContext, gitApi: GitApi, cwd: string) {
     this.panel = panel;
+    this.context = context;
     this.gitApi = gitApi;
     this.cwd = cwd;
+    this.extraRepoPaths = context.globalState.get<string[]>(EXTRA_REPOS_STATE_KEY, []);
     this.panel.webview.html = getHubHtml(this.panel.webview);
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
     this.panel.webview.onDidReceiveMessage(
@@ -99,11 +108,41 @@ export class HubPanel {
   }
 
   private loadRepositories() {
-    const repos = this.gitApi.repositories.map((repo) => ({
-      path: repo.rootUri.fsPath,
-      name: repoName(repo.rootUri.fsPath),
-    }));
+    const workspacePaths = new Set(this.gitApi.repositories.map((repo) => repo.rootUri.fsPath));
+    const repos = [
+      ...this.gitApi.repositories.map((repo) => repo.rootUri.fsPath),
+      ...this.extraRepoPaths.filter((path) => !workspacePaths.has(path)),
+    ].map((path) => ({ path, name: repoName(path) }));
     this.post({ type: "repositories", repos, current: this.cwd });
+  }
+
+  private async browseForRepository() {
+    const picked = await vscode.window.showOpenDialog({
+      canSelectFolders: true,
+      canSelectFiles: false,
+      canSelectMany: false,
+      openLabel: "Open as Repository",
+    });
+    if (!picked || picked.length === 0) {
+      return;
+    }
+
+    const uri = picked[0];
+    try {
+      await vscode.workspace.fs.stat(vscode.Uri.joinPath(uri, ".git"));
+    } catch {
+      vscode.window.showErrorMessage(
+        `Claude Commit: "${uri.fsPath}" doesn't look like a git repository (no .git found).`
+      );
+      return;
+    }
+
+    const path = uri.fsPath;
+    if (!this.extraRepoPaths.includes(path)) {
+      this.extraRepoPaths = [...this.extraRepoPaths, path];
+      await this.context.globalState.update(EXTRA_REPOS_STATE_KEY, this.extraRepoPaths);
+    }
+    this.switchRepository(path);
   }
 
   private async handleMessage(message: WebviewMessage) {
@@ -129,6 +168,9 @@ export class HubPanel {
         }
         break;
       }
+      case "browseRepository":
+        await this.browseForRepository();
+        break;
       case "getCommitDetail":
         await this.sendCommitDetail(message.hash as string);
         break;
@@ -351,6 +393,11 @@ function getHubHtml(webview: vscode.Webview): string {
   .combo-option.current { font-weight: 600; }
   .combo-option.empty { opacity: 0.6; cursor: default; }
   .combo-option.empty:hover { background: none; }
+  .combo-option.combo-action {
+    font-style: italic;
+    color: var(--vscode-descriptionForeground, inherit);
+    border-top: 1px solid var(--vscode-panel-border);
+  }
   button {
     background: var(--vscode-button-background);
     color: var(--vscode-button-foreground);
@@ -605,7 +652,7 @@ function getHubHtml(webview: vscode.Webview): string {
       var matches = filtered();
       activeIndex = -1;
       dropdown.innerHTML = "";
-      if (matches.length === 0) {
+      if (matches.length === 0 && !opts.extraAction) {
         var empty = document.createElement("div");
         empty.className = "combo-option empty";
         empty.textContent = opts.emptyText || "No matches";
@@ -621,6 +668,20 @@ function getHubHtml(webview: vscode.Webview): string {
           });
           dropdown.appendChild(el);
         });
+      }
+      // An always-shown action row (e.g. "Browse for repository...") -
+      // present regardless of the typed filter, since it's an action, not
+      // a value to filter against.
+      if (opts.extraAction) {
+        var actionEl = document.createElement("div");
+        actionEl.className = "combo-option combo-action";
+        actionEl.textContent = opts.extraAction.label;
+        actionEl.addEventListener("mousedown", function (e) {
+          e.preventDefault();
+          hide();
+          opts.extraAction.onSelect();
+        });
+        dropdown.appendChild(actionEl);
       }
       dropdown.style.display = "block";
     }
@@ -657,7 +718,12 @@ function getHubHtml(webview: vscode.Webview): string {
         var matches = filtered();
         if (activeIndex >= 0 && els[activeIndex]) {
           e.preventDefault();
-          commit(matches[activeIndex]);
+          if (opts.extraAction && activeIndex === matches.length) {
+            hide();
+            opts.extraAction.onSelect();
+          } else {
+            commit(matches[activeIndex]);
+          }
         } else if (opts.selectTopMatchOnEnter && matches.length > 0) {
           e.preventDefault();
           commit(matches[0]);
@@ -723,6 +789,10 @@ function getHubHtml(webview: vscode.Webview): string {
       }
     },
     onEscape: function () { repoInput.value = currentRepoName; },
+    extraAction: {
+      label: "Browse for repository...",
+      onSelect: function () { vscode.postMessage({ type: "browseRepository" }); },
+    },
   });
 
   function renderRepositories(repos, currentPath) {

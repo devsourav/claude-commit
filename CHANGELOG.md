@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.7
+
+- The Repository selector only ever listed repos already open in the
+  current VS Code workspace (a `vscode.git` API limitation, not a
+  filter). Added a "Browse for repository..." action always shown at the
+  bottom of the dropdown - opens a folder picker, validates it has a
+  `.git`, and switches to it. Repos opened this way are remembered across
+  panel reopens.
+
 ## 0.2.6
 
 - Reverted the chat-rendering changes from 0.2.3-0.2.5 back to the 0.2.2
