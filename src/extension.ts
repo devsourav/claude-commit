@@ -167,8 +167,9 @@ async function openHub(context: vscode.ExtensionContext, arg: unknown) {
     return;
   }
 
-  HubPanel.createOrShow(context, repository.rootUri.fsPath);
+  HubPanel.createOrShow(context, gitApi, repository.rootUri.fsPath);
 }
+
 
 function cleanMessage(raw: string): string {
   let message = raw.trim();
