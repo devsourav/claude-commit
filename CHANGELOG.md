@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.16
+
+- Fixed file-change badges (`+A`/`~M`/`-D`) showing nothing for merge
+  commits that actually did change files (e.g. a merge with a real
+  conflict resolution) - `git log`'s default traversal suppresses merge
+  diffs entirely, unlike `git show` (used for the expanded detail view),
+  which shows the combined diff by default. Added `--cc` to the badge
+  query so both agree.
+
+## 0.2.15
+
+- Darkened the commit-badge pill background (`+A`/`~M`/`-D`) - it used
+  the theme's generic badge color, which reads as too light/washed-out
+  against the badge text color in most dark themes.
+
 ## 0.2.14
 
 - Fixed the commit message showing twice in the expanded detail view -

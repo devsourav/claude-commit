@@ -143,7 +143,7 @@ export async function listCommits(
   const args = [
     ...pagedArgs,
     `--pretty=format:%H${FIELD_SEP}%h${FIELD_SEP}%an${FIELD_SEP}%ad${FIELD_SEP}%P${FIELD_SEP}%s${RECORD_SEP}`,
-    "--date=short",
+    "--date=format-local:%Y-%m-%dT%H:%M:%S",
   ];
 
   let commits: Omit<CommitSummary, "fileStats" | "lane">[] = [];
@@ -246,7 +246,13 @@ async function fetchLanes(cwd: string, predicateArgs: string[], throughCount: nu
 // of each commit's file list (a status line is never a 40/64-char hex
 // string), so the two can be told apart line by line.
 async function fetchFileStats(cwd: string, filterArgs: string[]): Promise<Map<string, CommitFileStats>> {
-  const args = [...filterArgs, "--pretty=format:%H", "--name-status"];
+  // --cc: `git log` suppresses merge-commit diffs entirely by default
+  // (even non-trivial ones with real conflict resolution), unlike
+  // `git show` on a single commit, which shows the combined diff by
+  // default - without this, merge commits would always report zero
+  // file changes here while still showing real changes in the detail
+  // view's `git show`-based fetch, an inconsistency between the two.
+  const args = [...filterArgs, "--pretty=format:%H", "--cc", "--name-status"];
   let out: string;
   try {
     out = await runGit(cwd, args);
@@ -307,7 +313,7 @@ async function tryResolveCommit(
       "-1",
       ref,
       `--pretty=format:%H${FIELD_SEP}%h${FIELD_SEP}%an${FIELD_SEP}%ad${FIELD_SEP}%P${FIELD_SEP}%s`,
-      "--date=short",
+      "--date=format-local:%Y-%m-%dT%H:%M:%S",
     ]);
     const trimmed = out.trim();
     if (!trimmed) {

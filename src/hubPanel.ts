@@ -591,7 +591,16 @@ function getHubHtml(webview: vscode.Webview): string {
   .commit-dot.lane-5 { --dot-color: var(--vscode-charts-yellow, #cca700); }
   .commit-row-main { min-width: 0; }
   .commit-subject { font-weight: 600; overflow: hidden; text-overflow: ellipsis; }
-  .commit-meta { font-size: 0.85em; opacity: 0.75; }
+  .commit-meta { font-size: 0.85em; display: flex; align-items: center; gap: 2px; }
+  .commit-meta-text { opacity: 0.75; }
+  .commit-author { font-weight: 600; color: var(--vscode-textLink-foreground, #3794ff); }
+  .commit-hash-pill {
+    font-family: var(--vscode-editor-font-family, monospace);
+    background: var(--vscode-textCodeBlock-background, rgba(127, 127, 127, 0.2));
+    color: var(--vscode-textPreformat-foreground, inherit);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
   .commit-badges { display: flex; gap: 6px; flex-shrink: 0; margin-top: 1px; }
   .commit-badge {
     font-size: 0.8em;
@@ -599,22 +608,25 @@ function getHubHtml(webview: vscode.Webview): string {
     font-variant-numeric: tabular-nums;
     padding: 1px 7px;
     border-radius: 10px;
-    background: var(--vscode-badge-background);
+    background: rgba(0, 0, 0, 0.35);
   }
   .commit-badge.added { color: var(--vscode-gitDecoration-addedResourceForeground, #4caf50); }
   .commit-badge.modified { color: var(--vscode-gitDecoration-modifiedResourceForeground, #e2c08d); }
   .commit-badge.deleted { color: var(--vscode-gitDecoration-deletedResourceForeground, #f14c4c); }
   .commit-detail { padding: 8px 8px 8px 20px; white-space: pre-wrap; font-size: 0.9em; }
-  .commit-hash-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
   .copy-hash-btn {
-    height: 22px;
-    width: 22px;
+    height: 20px;
+    width: 20px;
     padding: 0;
     line-height: 1;
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    background: transparent;
+    color: var(--vscode-button-background);
+    border-radius: 4px;
   }
+  .copy-hash-btn:hover { background: var(--vscode-toolbar-hoverBackground, rgba(127, 127, 127, 0.2)); }
   .commit-stat-line { margin-bottom: 6px; opacity: 0.9; }
   .stat-insertions { color: var(--vscode-gitDecoration-addedResourceForeground, #4caf50); }
   .stat-deletions { color: var(--vscode-gitDecoration-deletedResourceForeground, #f14c4c); }
@@ -1089,7 +1101,34 @@ function getHubHtml(webview: vscode.Webview): string {
       subject.textContent = commit.subject;
       var meta = document.createElement("div");
       meta.className = "commit-meta";
-      meta.textContent = commit.shortHash + " - " + commit.author + " - " + commit.date;
+      var hashPill = document.createElement("code");
+      hashPill.className = "commit-hash-pill";
+      hashPill.textContent = commit.shortHash;
+      var sep1 = document.createElement("span");
+      sep1.className = "commit-meta-text";
+      sep1.textContent = " · ";
+      var authorSpan = document.createElement("span");
+      authorSpan.className = "commit-author";
+      authorSpan.textContent = commit.author;
+      var metaText = document.createElement("span");
+      metaText.className = "commit-meta-text";
+      metaText.textContent = " · " + formatCommitDate(commit.date);
+      var copyBtn = document.createElement("button");
+      copyBtn.type = "button";
+      copyBtn.className = "copy-hash-btn";
+      copyBtn.title = "Copy hash";
+      copyBtn.textContent = "⧉";
+      copyBtn.addEventListener("click", function (e) {
+        e.stopPropagation();
+        vscode.postMessage({ type: "copyToClipboard", text: commit.hash });
+        copyBtn.textContent = "✓";
+        setTimeout(function () { copyBtn.textContent = "⧉"; }, 1200);
+      });
+      meta.appendChild(hashPill);
+      meta.appendChild(copyBtn);
+      meta.appendChild(sep1);
+      meta.appendChild(authorSpan);
+      meta.appendChild(metaText);
       main.appendChild(subject);
       main.appendChild(meta);
       lead.appendChild(main);
@@ -1147,6 +1186,22 @@ function getHubHtml(webview: vscode.Webview): string {
     });
   }
 
+  var MONTH_NAMES = ["January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December"];
+
+  function formatCommitDate(raw) {
+    var d = new Date(raw);
+    if (isNaN(d.getTime())) { return raw; }
+    var now = new Date();
+    var isToday = d.getFullYear() === now.getFullYear()
+      && d.getMonth() === now.getMonth()
+      && d.getDate() === now.getDate();
+    if (isToday) {
+      return "Today, " + d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+    }
+    return d.getDate() + " " + MONTH_NAMES[d.getMonth()] + " " + d.getFullYear();
+  }
+
   function parseStatSummary(raw) {
     var filesMatch = raw.match(/(\d+) files? changed/);
     var insMatch = raw.match(/(\d+) insertion/);
@@ -1172,25 +1227,6 @@ function getHubHtml(webview: vscode.Webview): string {
         body.textContent = detail.body;
         detailEl.appendChild(body);
       }
-
-      var hashRow = document.createElement("div");
-      hashRow.className = "commit-hash-row";
-      var hashCode = document.createElement("code");
-      hashCode.className = "inline-code";
-      hashCode.textContent = detail.hash.slice(0, 7);
-      var copyBtn = document.createElement("button");
-      copyBtn.type = "button";
-      copyBtn.className = "copy-hash-btn";
-      copyBtn.title = "Copy hash";
-      copyBtn.textContent = "⧉";
-      copyBtn.addEventListener("click", function () {
-        vscode.postMessage({ type: "copyToClipboard", text: detail.hash });
-        copyBtn.textContent = "✓";
-        setTimeout(function () { copyBtn.textContent = "⧉"; }, 1200);
-      });
-      hashRow.appendChild(hashCode);
-      hashRow.appendChild(copyBtn);
-      detailEl.appendChild(hashRow);
 
       var stat = parseStatSummary(detail.statSummary || "");
       if (stat.files || stat.insertions || stat.deletions) {
