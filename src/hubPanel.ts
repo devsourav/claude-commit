@@ -711,6 +711,18 @@ function getHubHtml(webview: vscode.Webview): string {
     border-radius: 3px;
     font-size: 0.9em;
   }
+  .bubble .code-block {
+    font-family: var(--vscode-editor-font-family, monospace);
+    background: var(--vscode-textCodeBlock-background, rgba(127, 127, 127, 0.2));
+    color: var(--vscode-textPreformat-foreground, inherit);
+    padding: 6px 8px;
+    border-radius: 4px;
+    font-size: 0.9em;
+    overflow-x: auto;
+    margin: 4px 0;
+  }
+  .bubble ul, .bubble ol { margin: 4px 0; padding-left: 22px; }
+  .bubble li { margin: 2px 0; }
   .bubble.user { align-self: flex-end; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
   .bubble.assistant { align-self: flex-start; background: var(--vscode-editorWidget-background); }
   .bubble.system { align-self: stretch; color: var(--vscode-errorForeground); font-style: italic; }
@@ -1376,20 +1388,143 @@ function getHubHtml(webview: vscode.Webview): string {
       .replace(/>/g, "&gt;");
   }
 
-  // Minimal markdown for chat replies: inline code spans (which is how
-  // commit hashes, branch names, dates, and file paths show up in Claude's
-  // answers) and **bold**. Escapes HTML first since this is model output,
-  // then relies on the bubble's existing pre-wrap white-space to keep
-  // plain newlines working without needing <br> conversion.
+  // Minimal markdown for chat replies: fenced code blocks, bullet/numbered
+  // lists, inline code spans (which is how commit hashes, branch names,
+  // dates, and file paths show up in Claude's answers), and bold text. This
+  // is a line-based parser (not a single global regex pass) because fenced
+  // code blocks and lists are multi-line constructs - a plain regex over
+  // the whole string can't tell a triple-backtick fence from a one-off
+  // inline backtick, and leaves list markers as literal dash/number text
+  // instead of real list markup.
+  //
+  // This whole file is itself one giant untagged template literal (the
+  // HTML this function builds), so any backslash escape sequence typed
+  // below - even inside what looks like a nested JS string or regex
+  // literal - is resolved by that outer literal before this code ever
+  // reaches the browser: unrecognized letter escapes silently lose their
+  // backslash (changing what a regex like a whitespace/digit shorthand
+  // matches), and recognized ones (newline, tab) are turned into real
+  // newline/tab bytes, which breaks out of whatever quotes they were
+  // written in - exactly the bug that made the chat panel fail to load
+  // entirely the first time this function used a raw newline escape in a
+  // string. Do not add backslash escapes (in strings or regex literals)
+  // below - build any special character from String.fromCharCode instead,
+  // the same way BACKTICK avoids embedding a literal backtick that would
+  // terminate the outer template early.
   var BACKTICK = String.fromCharCode(96);
+  var NEWLINE = String.fromCharCode(10);
   var inlineCodePattern = new RegExp(BACKTICK + "([^" + BACKTICK + "]+)" + BACKTICK, "g");
+  var FENCE = BACKTICK + BACKTICK + BACKTICK;
+  var BOLD = "*" + "*";
 
-  function renderMarkdownLite(text) {
-    var html = escapeHtml(text);
+  function isSpaceOrTab(ch) {
+    return ch === " " || ch === String.fromCharCode(9);
+  }
+
+  function isDigit(ch) {
+    return ch >= "0" && ch <= "9";
+  }
+
+  function trimLeft(line) {
+    var i = 0;
+    while (i < line.length && isSpaceOrTab(line.charAt(i))) { i++; }
+    return line.slice(i);
+  }
+
+  function isFenceLine(line) {
+    return trimLeft(line).slice(0, 3) === FENCE;
+  }
+
+  function matchBullet(line) {
+    var trimmed = trimLeft(line);
+    if ((trimmed.charAt(0) === "-" || trimmed.charAt(0) === "*") && isSpaceOrTab(trimmed.charAt(1))) {
+      return trimLeft(trimmed.slice(1));
+    }
+    return null;
+  }
+
+  function matchNumbered(line) {
+    var trimmed = trimLeft(line);
+    var i = 0;
+    while (i < trimmed.length && isDigit(trimmed.charAt(i))) { i++; }
+    if (i === 0) { return null; }
+    var marker = trimmed.charAt(i);
+    if ((marker === "." || marker === ")") && isSpaceOrTab(trimmed.charAt(i + 1))) {
+      return trimLeft(trimmed.slice(i + 1));
+    }
+    return null;
+  }
+
+  function renderInlineMarkdown(line) {
+    var html = escapeHtml(line);
     html = html.replace(inlineCodePattern, function (_, code) {
       return '<code class="inline-code">' + code + "</code>";
     });
-    html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    var parts = html.split(BOLD);
+    if (parts.length > 2) {
+      var out = "";
+      for (var p = 0; p < parts.length; p++) {
+        out += p % 2 === 1 ? "<strong>" + parts[p] + "</strong>" : parts[p];
+      }
+      html = out;
+    }
+    return html;
+  }
+
+  function renderMarkdownLite(text) {
+    var lines = String(text).split(NEWLINE);
+    var html = "";
+    var listType = null;
+
+    function closeList() {
+      if (listType) {
+        html += "</" + listType + ">";
+        listType = null;
+      }
+    }
+
+    var i = 0;
+    while (i < lines.length) {
+      var line = lines[i];
+
+      if (isFenceLine(line)) {
+        closeList();
+        var codeLines = [];
+        i++;
+        while (i < lines.length && !isFenceLine(lines[i])) {
+          codeLines.push(lines[i]);
+          i++;
+        }
+        i++; // skip closing fence (or end of text if it was never closed)
+        html += '<pre class="code-block"><code>' + escapeHtml(codeLines.join(NEWLINE)) + "</code></pre>";
+        continue;
+      }
+
+      var bulletContent = matchBullet(line);
+      var numberedContent = matchNumbered(line);
+
+      if (bulletContent !== null) {
+        if (listType !== "ul") { closeList(); html += "<ul>"; listType = "ul"; }
+        html += "<li>" + renderInlineMarkdown(bulletContent) + "</li>";
+        i++;
+        continue;
+      }
+      if (numberedContent !== null) {
+        if (listType !== "ol") { closeList(); html += "<ol>"; listType = "ol"; }
+        html += "<li>" + renderInlineMarkdown(numberedContent) + "</li>";
+        i++;
+        continue;
+      }
+
+      closeList();
+      if (line.trim() === "") {
+        html += "<br>";
+      } else {
+        html += renderInlineMarkdown(line) + "<br>";
+      }
+      i++;
+    }
+    closeList();
     return html;
   }
 
