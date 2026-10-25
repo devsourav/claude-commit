@@ -1,8 +1,8 @@
 {
   "name": "claude-commit",
   "displayName": "Claude Commit",
-  "description": "Generate commit messages, browse commit history, and chat about your repo's history - all powered by the Claude Code CLI.",
-  "version": "0.2.16",
+  "description": "Generate commit messages, browse commit history, chat about your repo, and share a team memory pool (Swagger, docs, Figma, notes) - all powered by the Claude Code CLI.",
+  "version": "0.2.20",
   "publisher": "devsourav",
   "icon": "icon.png",
   "license": "MIT",
@@ -22,7 +22,12 @@
     "commit",
     "claude",
     "ai",
-    "chat"
+    "chat",
+    "figma",
+    "swagger",
+    "openapi",
+    "team",
+    "memory"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -37,6 +42,39 @@
         "command": "claudeCommit.openHub",
         "title": "Open History & Chat (Claude)",
         "icon": "$(comment-discussion)",
+        "category": "Claude Commit"
+      },
+      {
+        "command": "claudeCommit.openHubNewTab",
+        "title": "New History & Chat Tab (Claude)",
+        "icon": "$(add)",
+        "category": "Claude Commit"
+      },
+      {
+        "command": "claudeCommit.openPool",
+        "title": "Open Team Pool (Claude)",
+        "icon": "$(library)",
+        "category": "Claude Commit"
+      },
+      {
+        "command": "claudeCommit.openPoolNewTab",
+        "title": "New Team Pool Tab (Claude)",
+        "icon": "$(add)",
+        "category": "Claude Commit"
+      },
+      {
+        "command": "claudeCommit.saveSelectionToPool",
+        "title": "Save Selection to Team Pool",
+        "category": "Claude Commit"
+      },
+      {
+        "command": "claudeCommit.addSelectionToPoolChat",
+        "title": "Add Selection to Team Pool Chat",
+        "category": "Claude Commit"
+      },
+      {
+        "command": "claudeCommit.focusPoolChat",
+        "title": "Focus Team Pool Chat",
         "category": "Claude Commit"
       }
     ],
@@ -73,6 +111,59 @@
         {
           "command": "claudeCommit.openHub",
           "when": "gitOpenRepositoryCount != 0"
+        },
+        {
+          "command": "claudeCommit.openPool",
+          "when": "gitOpenRepositoryCount != 0"
+        },
+        {
+          "command": "claudeCommit.saveSelectionToPool",
+          "when": "editorHasSelection"
+        },
+        {
+          "command": "claudeCommit.addSelectionToPoolChat",
+          "when": "editorIsOpen"
+        },
+        {
+          "command": "claudeCommit.focusPoolChat",
+          "when": "gitOpenRepositoryCount != 0"
+        },
+        {
+          "command": "claudeCommit.openHubNewTab",
+          "when": "activeWebviewPanelId == 'claudeCommitHub'"
+        },
+        {
+          "command": "claudeCommit.openPoolNewTab",
+          "when": "activeWebviewPanelId == 'claudeCommitPool'"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "claudeCommit.openPool",
+          "when": "gitOpenRepositoryCount != 0",
+          "group": "navigation@100"
+        },
+        {
+          "command": "claudeCommit.openHubNewTab",
+          "when": "activeWebviewPanelId == 'claudeCommitHub'",
+          "group": "navigation@1"
+        },
+        {
+          "command": "claudeCommit.openPoolNewTab",
+          "when": "activeWebviewPanelId == 'claudeCommitPool'",
+          "group": "navigation@1"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "claudeCommit.addSelectionToPoolChat",
+          "when": "editorTextFocus && gitOpenRepositoryCount != 0",
+          "group": "claudeCommit"
+        },
+        {
+          "command": "claudeCommit.saveSelectionToPool",
+          "when": "editorHasSelection && gitOpenRepositoryCount != 0",
+          "group": "claudeCommit"
         }
       ]
     },
@@ -103,9 +194,54 @@
           "type": "number",
           "default": 60,
           "description": "How long to wait for the Claude Code CLI before giving up."
+        },
+        "claudeCommit.pool.figmaTools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "mcp__claude_ai_Figma__get_design_context",
+            "mcp__claude_ai_Figma__get_metadata",
+            "mcp__claude_ai_Figma__get_screenshot",
+            "mcp__claude_ai_Figma__get_variable_defs",
+            "mcp__figma__get_design_context",
+            "mcp__figma__get_metadata",
+            "mcp__figma__get_screenshot",
+            "mcp__figma__get_variable_defs"
+          ],
+          "description": "Figma MCP tools the Team Pool may use when importing Figma frames. Read-only tools only by default; the first set matches the claude.ai Figma connector, the second a locally added server named 'figma'."
+        },
+        "claudeCommit.pool.chatTools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Built-in Claude Code tools the Team Pool chat loads in edit modes. Empty uses a lean default (Read, Grep, Glob, Bash, Edit, Write, NotebookEdit, WebFetch, WebSearch, TodoWrite, ToolSearch). Every extra tool's schema is sent on each turn, so add e.g. \"Task\" only if you need subagents."
+        },
+        "claudeCommit.pool.autoCompactTokens": {
+          "type": "number",
+          "default": 100000,
+          "minimum": 0,
+          "description": "When a Team Pool conversation's context grows past this many tokens, it's compacted (/compact) right after the turn, while the prompt cache is still warm. Every step of a turn re-sends the whole context, so this keeps long sessions cheap. Large-context models never hit Claude Code's own auto-compact in practice. 0 disables."
         }
       }
-    }
+    },
+    "keybindings": [
+      {
+        "command": "claudeCommit.addSelectionToPoolChat",
+        "key": "alt+shift+k",
+        "mac": "alt+shift+k",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "claudeCommit.focusPoolChat",
+        "key": "ctrl+alt+escape",
+        "mac": "ctrl+escape",
+        "when": "!activeWebviewPanelId || activeWebviewPanelId != 'claudeCommitPool'"
+      }
+    ]
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

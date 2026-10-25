@@ -21,6 +21,13 @@ interface ChatTurn {
   text: string;
 }
 
+interface DesignAttachment {
+  name: string;
+  mimeType: string;
+  size: number;
+  dataUrl: string;
+}
+
 // Pre-0.2.9 shape: one continuous thread per repo. Read (but never written)
 // for one-time migration into the multi-conversation model below.
 interface LegacyPersistedChatState {
@@ -44,12 +51,15 @@ function deriveConversationTitle(firstMessage: string): string {
   return oneLine.length > 60 ? oneLine.slice(0, 57) + "..." : oneLine;
 }
 
-// Singleton webview panel: History + Chat tabs over the repo at `cwd`.
-// Re-showing the command while a panel is already open just reveals and
-// resets it (or switches to a different repository), rather than opening a
-// second one.
+// Webview panel: History + Chat tabs over the repo at `cwd`. Re-showing the
+// "Open History & Chat" command while a panel is already open just reveals
+// and resets the most recently used one (or switches it to a different
+// repository) rather than opening a second one - but "New Tab" (next to the
+// close button, like Claude Code's own icon) always opens an additional,
+// independent panel, each with its own conversation state.
 export class HubPanel {
   private static current: HubPanel | undefined;
+  private static readonly allPanels = new Set<HubPanel>();
 
   private readonly panel: vscode.WebviewPanel;
   private readonly context: vscode.ExtensionContext;
@@ -71,6 +81,13 @@ export class HubPanel {
   private historySince: string | undefined;
   private historyUntil: string | undefined;
 
+  // The repo of whichever Hub tab is currently focused/most recently used -
+  // lets the title-bar "New Tab" button default to the same repo as the tab
+  // it was clicked from, rather than re-prompting or guessing.
+  static activeCwd(): string | undefined {
+    return HubPanel.current?.cwd;
+  }
+
   static createOrShow(context: vscode.ExtensionContext, gitApi: GitApi, cwd: string) {
     if (HubPanel.current) {
       HubPanel.current.panel.reveal(undefined, true);
@@ -81,6 +98,13 @@ export class HubPanel {
       }
       return;
     }
+    HubPanel.createNewTab(context, gitApi, cwd);
+  }
+
+  // Always opens a fresh, independent panel instead of reusing/reveal-ing
+  // an existing one - the "New Tab" title-bar button's equivalent of
+  // clicking Claude Code's own icon to start another chat window.
+  static createNewTab(context: vscode.ExtensionContext, gitApi: GitApi, cwd: string) {
     const panel = vscode.window.createWebviewPanel(
       "claudeCommitHub",
       "Claude Commit",
@@ -96,8 +120,14 @@ export class HubPanel {
     this.gitApi = gitApi;
     this.cwd = cwd;
     this.extraRepoPaths = context.globalState.get<string[]>(EXTRA_REPOS_STATE_KEY, []);
+    HubPanel.allPanels.add(this);
     this.panel.webview.html = getHubHtml(this.panel.webview);
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
+    this.panel.onDidChangeViewState((e) => {
+      if (e.webviewPanel.active) {
+        HubPanel.current = this;
+      }
+    }, null, this.disposables);
     this.panel.webview.onDidReceiveMessage(
       (message: WebviewMessage) => this.handleMessage(message),
       null,
@@ -111,7 +141,10 @@ export class HubPanel {
   }
 
   private dispose() {
-    HubPanel.current = undefined;
+    HubPanel.allPanels.delete(this);
+    if (HubPanel.current === this) {
+      HubPanel.current = HubPanel.allPanels.values().next().value;
+    }
     while (this.disposables.length) {
       this.disposables.pop()?.dispose();
     }
@@ -226,9 +259,17 @@ export class HubPanel {
     return [];
   }
 
+  // Merges rather than overwrites: with multiple tabs open on the same repo
+  // (see "New Tab"), each holds its own in-memory conversation list, so a
+  // blind overwrite here would silently drop conversations another tab
+  // created or updated since this one last loaded.
   private async saveConversations() {
     const all = this.context.globalState.get<Record<string, ChatConversation[]>>(CONVERSATIONS_STATE_KEY, {});
-    all[this.cwd] = this.conversations;
+    const byId = new Map((all[this.cwd] ?? []).map((c) => [c.id, c]));
+    for (const convo of this.conversations) {
+      byId.set(convo.id, convo);
+    }
+    all[this.cwd] = [...byId.values()];
     await this.context.globalState.update(CONVERSATIONS_STATE_KEY, all);
   }
 
@@ -313,6 +354,15 @@ export class HubPanel {
         break;
       case "switchConversation":
         this.activateConversation(message.id as string);
+        break;
+      case "designGenerate":
+        await this.handleDesignGenerate({
+          responsive: Boolean(message.responsive),
+          figmaUrl: message.figmaUrl as string | undefined,
+          breakpoints: message.breakpoints as Record<string, string> | undefined,
+          prompt: message.prompt as string,
+          attachments: (message.attachments as DesignAttachment[] | undefined) ?? [],
+        });
         break;
     }
   }
@@ -425,6 +475,43 @@ export class HubPanel {
     }
   }
 
+  // Placeholder for the Figma-MCP-driven design-to-code flow: the Design
+  // tab's UI (single or per-breakpoint Figma URLs, file attachments, and an
+  // optional detail prompt) is wired up end to end, but actually invoking
+  // Figma's MCP server and writing pixel-perfect component code from it is
+  // a follow-up step.
+  private async handleDesignGenerate(params: {
+    responsive: boolean;
+    figmaUrl?: string;
+    breakpoints?: Record<string, string>;
+    prompt: string;
+    attachments: DesignAttachment[];
+  }) {
+    this.post({ type: "designBusy", busy: true });
+    const received: string[] = [];
+    if (params.responsive && params.breakpoints) {
+      const parts = ["sm", "md", "lg", "xl", "2xl"]
+        .filter((bp) => params.breakpoints![bp])
+        .map((bp) => `${bp}: ${params.breakpoints![bp]}`);
+      if (parts.length) {
+        received.push(`breakpoints - ${parts.join(", ")}`);
+      }
+    } else if (params.figmaUrl) {
+      received.push(`Figma URL - ${params.figmaUrl}`);
+    }
+    if (params.attachments.length) {
+      received.push(`${params.attachments.length} attached file(s) - ${params.attachments.map((a) => a.name).join(", ")}`);
+    }
+    this.post({
+      type: "designMessage",
+      role: "system",
+      text:
+        "Design generation isn't wired up yet - this will use the Figma MCP server to build this design in a follow-up step." +
+        (received.length ? ` Received ${received.join("; ")}.` : ""),
+    });
+    this.post({ type: "designBusy", busy: false });
+  }
+
   private post(message: unknown) {
     this.panel.webview.postMessage(message);
   }
@@ -477,7 +564,7 @@ function getHubHtml(webview: vscode.Webview): string {
   }
   .tab-panel { display: none; padding: 12px; }
   .tab-panel.active { display: block; }
-  #chat.tab-panel.active {
+  #chat.tab-panel.active, #design.tab-panel.active {
     display: flex;
     flex-direction: column;
     height: calc(100vh - var(--tabs-height, 41px));
@@ -726,17 +813,15 @@ function getHubHtml(webview: vscode.Webview): string {
   .bubble.user { align-self: flex-end; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
   .bubble.assistant { align-self: flex-start; background: var(--vscode-editorWidget-background); }
   .bubble.system { align-self: stretch; color: var(--vscode-errorForeground); font-style: italic; }
-  .bubble.thinking-bubble { display: flex; align-items: center; gap: 6px; opacity: 0.85; }
-  .thinking-dots { display: flex; gap: 3px; }
-  .thinking-dots span {
-    width: 5px; height: 5px; border-radius: 50%;
-    background: var(--vscode-foreground);
-    opacity: 0.3;
-    animation: thinking-blink 1.4s infinite both;
+  .bubble.thinking-bubble { display: flex; align-items: baseline; gap: 6px; opacity: 0.85; }
+  .thinking-spinner {
+    color: #d97757;
+    font-weight: bold;
+    display: inline-block;
+    width: 1em;
+    text-align: center;
   }
-  .thinking-dots span:nth-child(2) { animation-delay: 0.2s; }
-  .thinking-dots span:nth-child(3) { animation-delay: 0.4s; }
-  @keyframes thinking-blink { 0%, 80%, 100% { opacity: 0.2; } 40% { opacity: 1; } }
+  .thinking-label { color: var(--vscode-descriptionForeground); }
   .chat-input-row { display: flex; gap: 6px; align-items: flex-end; flex-shrink: 0; }
   #chatSendBtn { height: 32px; }
   #chatInput {
@@ -753,12 +838,121 @@ function getHubHtml(webview: vscode.Webview): string {
   }
   .empty, .error-banner { opacity: 0.75; padding: 6px 0; }
   .error-banner { color: var(--vscode-errorForeground); }
+  .design-body { display: flex; flex-direction: column; flex: 1; min-height: 0; gap: 10px; }
+  #designLog {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding-right: 14px;
+  }
+  .design-form { display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
+  #figmaUrlInput { width: 100%; }
+  .design-toggle-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .design-toggle-row input[type="checkbox"] { margin: 0; cursor: pointer; }
+  .design-breakpoints {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .design-breakpoint-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .design-breakpoint-row label {
+    flex: 0 0 34px;
+    font-size: 11px;
+    font-weight: 600;
+    opacity: 0.75;
+    text-transform: uppercase;
+  }
+  .design-breakpoint-row input[type="text"] { flex: 1; }
+  .design-dropzone {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    border: 1px dashed var(--vscode-input-border, var(--vscode-panel-border));
+    border-radius: 4px;
+    padding: 10px;
+    text-align: center;
+    opacity: 0.85;
+    font-size: 12px;
+  }
+  .design-dropzone.dragover {
+    border-color: var(--vscode-focusBorder);
+    opacity: 1;
+    background: var(--vscode-list-hoverBackground);
+  }
+  .link-btn {
+    background: none;
+    border: none;
+    height: auto;
+    padding: 0;
+    color: var(--vscode-textLink-foreground);
+    text-decoration: underline;
+    cursor: pointer;
+  }
+  .link-btn:hover { background: none; color: var(--vscode-textLink-activeForeground); }
+  .design-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .design-attachment-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: var(--vscode-badge-background);
+    color: var(--vscode-badge-foreground);
+    border-radius: 10px;
+    padding: 2px 4px 2px 10px;
+    font-size: 12px;
+    max-width: 220px;
+  }
+  .design-attachment-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .design-attachment-remove {
+    background: none;
+    border: none;
+    color: inherit;
+    height: auto;
+    padding: 0 4px;
+    cursor: pointer;
+    opacity: 0.8;
+    line-height: 1;
+  }
+  .design-attachment-remove:hover { opacity: 1; background: none; }
+  #designPromptInput {
+    resize: vertical;
+    min-height: 60px;
+    background: var(--vscode-input-background);
+    color: var(--vscode-input-foreground);
+    border: 1px solid var(--vscode-input-border, transparent);
+    padding: 6px;
+    font-family: inherit;
+    font-size: inherit;
+  }
+  #designGenerateBtn { align-self: flex-start; }
 </style>
 </head>
 <body>
   <div class="tabs">
     <button class="tab-btn active" data-tab="history">History</button>
     <button class="tab-btn" data-tab="chat">Chat</button>
+    <button class="tab-btn" data-tab="design">Design</button>
   </div>
 
   <div id="history" class="tab-panel active">
@@ -807,6 +1001,50 @@ function getHubHtml(webview: vscode.Webview): string {
         <button id="newChatBtn">+ New chat</button>
         <input id="conversationSearch" type="text" placeholder="Search conversations...">
         <ul id="conversationList"></ul>
+      </div>
+    </div>
+  </div>
+
+  <div id="design" class="tab-panel">
+    <div class="design-body">
+      <div id="designLog"></div>
+      <div class="design-form">
+        <label class="design-toggle-row">
+          <input id="responsiveToggle" type="checkbox">
+          <span>Responsive design (separate Figma URL per breakpoint)</span>
+        </label>
+        <div id="figmaUrlSingle">
+          <input id="figmaUrlInput" type="text" placeholder="Figma file or frame URL...">
+        </div>
+        <div id="figmaUrlResponsive" class="design-breakpoints" style="display:none">
+          <div class="design-breakpoint-row">
+            <label for="figmaUrlSm">sm</label>
+            <input id="figmaUrlSm" type="text" placeholder="Figma URL for sm (≥640px)">
+          </div>
+          <div class="design-breakpoint-row">
+            <label for="figmaUrlMd">md</label>
+            <input id="figmaUrlMd" type="text" placeholder="Figma URL for md (≥768px)">
+          </div>
+          <div class="design-breakpoint-row">
+            <label for="figmaUrlLg">lg</label>
+            <input id="figmaUrlLg" type="text" placeholder="Figma URL for lg (≥1024px)">
+          </div>
+          <div class="design-breakpoint-row">
+            <label for="figmaUrlXl">xl</label>
+            <input id="figmaUrlXl" type="text" placeholder="Figma URL for xl (≥1280px)">
+          </div>
+          <div class="design-breakpoint-row">
+            <label for="figmaUrl2xl">2xl</label>
+            <input id="figmaUrl2xl" type="text" placeholder="Figma URL for 2xl (≥1536px)">
+          </div>
+        </div>
+        <div id="designDropzone" class="design-dropzone">
+          <span>Drag &amp; drop files here, or <button type="button" id="designAttachBtn" class="link-btn">browse</button></span>
+          <input id="designFileInput" type="file" multiple style="display:none">
+        </div>
+        <div id="designAttachments" class="design-attachments"></div>
+        <textarea id="designPromptInput" rows="3" placeholder="Optional: describe the design in more detail (spacing, states, breakpoints, etc.)"></textarea>
+        <button id="designGenerateBtn">Generate</button>
       </div>
     </div>
   </div>
@@ -1302,6 +1540,23 @@ function getHubHtml(webview: vscode.Webview): string {
   var chatSidebar = document.getElementById("chatSidebar");
   var conversationList = document.getElementById("conversationList");
   var conversationSearch = document.getElementById("conversationSearch");
+  var designLog = document.getElementById("designLog");
+  var responsiveToggle = document.getElementById("responsiveToggle");
+  var figmaUrlSingle = document.getElementById("figmaUrlSingle");
+  var figmaUrlResponsive = document.getElementById("figmaUrlResponsive");
+  var figmaUrlInput = document.getElementById("figmaUrlInput");
+  var figmaUrlSm = document.getElementById("figmaUrlSm");
+  var figmaUrlMd = document.getElementById("figmaUrlMd");
+  var figmaUrlLg = document.getElementById("figmaUrlLg");
+  var figmaUrlXl = document.getElementById("figmaUrlXl");
+  var figmaUrl2xl = document.getElementById("figmaUrl2xl");
+  var designDropzone = document.getElementById("designDropzone");
+  var designAttachBtn = document.getElementById("designAttachBtn");
+  var designFileInput = document.getElementById("designFileInput");
+  var designAttachmentsEl = document.getElementById("designAttachments");
+  var designAttachments = [];
+  var designPromptInput = document.getElementById("designPromptInput");
+  var designGenerateBtn = document.getElementById("designGenerateBtn");
   var newChatBtn = document.getElementById("newChatBtn");
   var sidebarToggleBtn = document.getElementById("sidebarToggleBtn");
   var allConversations = [];
@@ -1552,25 +1807,46 @@ function getHubHtml(webview: vscode.Webview): string {
     scrollChatToBottom();
   }
 
+  var THINKING_VERBS = [
+    "Pondering", "Noodling", "Percolating", "Mulling", "Ruminating", "Cogitating",
+    "Puzzling", "Synthesizing", "Simmering", "Churning", "Brewing", "Tinkering",
+    "Musing", "Deliberating", "Combobulating", "Herding tokens", "Reticulating",
+    "Marinating", "Stewing", "Crunching", "Divining", "Wrangling", "Unfurling",
+  ];
+  var SPINNER_FRAMES = ["·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"];
+  var thinkingTimer = null;
+
   function showThinking() {
     if (document.getElementById("thinkingBubble")) { return; }
     var b = document.createElement("div");
     b.className = "bubble assistant thinking-bubble";
     b.id = "thinkingBubble";
+    var spinner = document.createElement("span");
+    spinner.className = "thinking-spinner";
     var label = document.createElement("span");
-    label.textContent = "Claude is thinking";
-    var dots = document.createElement("span");
-    dots.className = "thinking-dots";
-    dots.innerHTML = "<span></span><span></span><span></span>";
+    label.className = "thinking-label";
+    b.appendChild(spinner);
     b.appendChild(label);
-    b.appendChild(dots);
     chatLog.appendChild(b);
     if (chatAutoScroll) { scrollChatToBottom(); }
+
+    var verb = THINKING_VERBS[Math.floor(Math.random() * THINKING_VERBS.length)];
+    var start = Date.now();
+    var frame = 0;
+    var tick = function () {
+      spinner.textContent = SPINNER_FRAMES[frame % SPINNER_FRAMES.length];
+      frame++;
+      var elapsed = Math.floor((Date.now() - start) / 1000);
+      label.textContent = " " + verb + "… (" + elapsed + "s)";
+    };
+    tick();
+    thinkingTimer = setInterval(tick, 100);
   }
 
   function hideThinking() {
     var el = document.getElementById("thinkingBubble");
     if (el) { el.remove(); }
+    if (thinkingTimer) { clearInterval(thinkingTimer); thinkingTimer = null; }
   }
 
   function autoGrow() {
@@ -1594,6 +1870,137 @@ function getHubHtml(webview: vscode.Webview): string {
       sendChat();
     }
   });
+
+  function appendDesignMessage(role, text) {
+    var b = document.createElement("div");
+    b.className = "bubble " + role;
+    b.textContent = text == null ? "" : String(text);
+    designLog.appendChild(b);
+    designLog.scrollTop = designLog.scrollHeight;
+  }
+
+  responsiveToggle.addEventListener("change", function () {
+    var on = responsiveToggle.checked;
+    figmaUrlSingle.style.display = on ? "none" : "block";
+    figmaUrlResponsive.style.display = on ? "flex" : "none";
+  });
+
+  function renderDesignAttachments() {
+    designAttachmentsEl.innerHTML = "";
+    designAttachments.forEach(function (att, idx) {
+      var chip = document.createElement("span");
+      chip.className = "design-attachment-chip";
+      var name = document.createElement("span");
+      name.className = "design-attachment-name";
+      name.textContent = att.name;
+      name.title = att.name;
+      var remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "design-attachment-remove";
+      remove.title = "Remove";
+      remove.textContent = "×";
+      remove.addEventListener("click", function () {
+        designAttachments.splice(idx, 1);
+        renderDesignAttachments();
+      });
+      chip.appendChild(name);
+      chip.appendChild(remove);
+      designAttachmentsEl.appendChild(chip);
+    });
+  }
+
+  function readFileAsDataUrl(file) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () { resolve(reader.result); };
+      reader.onerror = function () { reject(reader.error); };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function addDesignFiles(fileList) {
+    Array.prototype.slice.call(fileList).forEach(function (file) {
+      readFileAsDataUrl(file).then(function (dataUrl) {
+        designAttachments.push({ name: file.name, mimeType: file.type, size: file.size, dataUrl: dataUrl });
+        renderDesignAttachments();
+      });
+    });
+  }
+
+  designAttachBtn.addEventListener("click", function () {
+    designFileInput.click();
+  });
+  designFileInput.addEventListener("change", function () {
+    addDesignFiles(designFileInput.files);
+    designFileInput.value = "";
+  });
+  designDropzone.addEventListener("dragover", function (e) {
+    e.preventDefault();
+    designDropzone.classList.add("dragover");
+  });
+  designDropzone.addEventListener("dragleave", function () {
+    designDropzone.classList.remove("dragover");
+  });
+  designDropzone.addEventListener("drop", function (e) {
+    e.preventDefault();
+    designDropzone.classList.remove("dragover");
+    if (e.dataTransfer && e.dataTransfer.files) {
+      addDesignFiles(e.dataTransfer.files);
+    }
+  });
+
+  function sendDesignGenerate() {
+    var responsive = responsiveToggle.checked;
+    var figmaUrl = "";
+    var breakpoints = null;
+    if (responsive) {
+      breakpoints = {
+        sm: figmaUrlSm.value.trim(),
+        md: figmaUrlMd.value.trim(),
+        lg: figmaUrlLg.value.trim(),
+        xl: figmaUrlXl.value.trim(),
+        "2xl": figmaUrl2xl.value.trim()
+      };
+      var hasAny = Object.keys(breakpoints).some(function (k) { return breakpoints[k]; });
+      if (!hasAny) {
+        figmaUrlSm.focus();
+        return;
+      }
+    } else {
+      figmaUrl = figmaUrlInput.value.trim();
+      if (!figmaUrl) {
+        figmaUrlInput.focus();
+        return;
+      }
+    }
+    var prompt = designPromptInput.value.trim();
+    var summaryLines = [];
+    if (responsive) {
+      ["sm", "md", "lg", "xl", "2xl"].forEach(function (bp) {
+        if (breakpoints[bp]) { summaryLines.push(bp + ": " + breakpoints[bp]); }
+      });
+    } else {
+      summaryLines.push(figmaUrl);
+    }
+    if (prompt) { summaryLines.push(prompt); }
+    if (designAttachments.length) {
+      summaryLines.push("Attached: " + designAttachments.map(function (a) { return a.name; }).join(", "));
+    }
+    appendDesignMessage("user", summaryLines.join(NEWLINE + NEWLINE));
+    vscode.postMessage({
+      type: "designGenerate",
+      responsive: responsive,
+      figmaUrl: figmaUrl,
+      breakpoints: breakpoints,
+      prompt: prompt,
+      attachments: designAttachments.map(function (a) {
+        return { name: a.name, mimeType: a.mimeType, size: a.size, dataUrl: a.dataUrl };
+      })
+    });
+    designAttachments = [];
+    renderDesignAttachments();
+  }
+  designGenerateBtn.addEventListener("click", sendDesignGenerate);
 
   window.addEventListener("message", function (event) {
     var msg = event.data;
@@ -1641,6 +2048,12 @@ function getHubHtml(webview: vscode.Webview): string {
       case "error":
         historyError.style.display = "block";
         historyError.textContent = msg.message;
+        break;
+      case "designMessage":
+        appendDesignMessage(msg.role, msg.text);
+        break;
+      case "designBusy":
+        designGenerateBtn.disabled = msg.busy;
         break;
     }
   });

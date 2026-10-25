@@ -1,5 +1,56 @@
 # Changelog
 
+## Unreleased
+
+- Team Pool chat token usage, fixed at the source:
+  - **One persistent `claude` process per conversation**, replacing a new
+    `--resume` process per message. The resumed process missed the prompt
+    cache and re-wrote the whole conversation at cache-write price on
+    almost every message.
+  - **Auto-compact** after a turn once context passes
+    `claudeCommit.pool.autoCompactTokens` (default 100k). Large-context
+    models otherwise never compact, and every step re-sends everything.
+  - **Images sent inline**, with no extra file-read request, and Claude is
+    nudged to Grep first and read line ranges.
+  - **Stop and Shift+Tab** no longer restart the session.
+  - The status line now says "context" instead of "tokens", since the
+    number is the context size re-read each step, not new usage.
+
+- Team Pool chat redesigned to match the Claude Code panel: a turn
+  timeline with expandable tool rows and edit `+/-` counts, a numbered
+  permission prompt (keys 1/2/3), Shift+Tab permission modes, a
+  model/effort pill, `/` commands (Claude Code's own plus panel commands),
+  `+` attachments with image paste/drop, message queueing, prompt history
+  (↑/↓), an idle/prompt-cache notice, conversation history, and a mic
+  button using OS dictation.
+
+- Added the **Team Pool**: a panel that opens beside the editor from the
+  editor title bar. It has a streaming, pool-aware chat that shows tool
+  activity and has Stop, model and module selectors, and "Save to pool".
+  It also has a UI to browse and contribute to a shared, repo-committed
+  memory pool under `.claude-pool/`: notes, Swagger/OpenAPI specs, docs,
+  links (including Claude share links) and Figma frames via the Figma
+  MCP server. A one-click CLAUDE.md link makes every teammate's Claude
+  Code load the pool index.
+- Added **Save Selection to Team Pool** to the editor context menu.
+- The Team Pool chat can edit files and run commands like Claude Code,
+  behind in-panel approvals with a native diff preview. Permission modes:
+  ask, edit automatically, auto, plan, and read-only.
+- Safety check before every file change and command in the Team Pool chat,
+  in every mode, including auto-accept. It blocks edits outside the repo or
+  inside `.git/`, edits that write credentials, invalid JSON, and
+  destructive commands. Sensitive files, large shrinking rewrites, and git
+  commit/push always ask first. Pool entries and uploads are scanned for
+  credentials before saving.
+- Much lower token usage: commit messages ~33k → ~1k input tokens plus
+  CLAUDE.md (no agent scaffolding, lean diff without lockfiles/minified
+  files, 1 line of context). Chats ~33k → ~13k (only the tools each mode
+  needs). Ingestion loads one tool per source type. New setting
+  `claudeCommit.pool.chatTools`.
+- File references in the Team Pool chat: `@` file autocomplete,
+  **Alt+Shift+K** / *Add Selection to Team Pool Chat* to insert
+  `@path#L10-20`, and the current editor selection attached automatically.
+
 ## 0.2.16
 
 - Fixed file-change badges (`+A`/`~M`/`-D`) showing nothing for merge

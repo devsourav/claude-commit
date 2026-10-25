@@ -1,19 +1,46 @@
 import * as vscode from "vscode";
 import { getDiffToAnalyze, getDiffStat, getRecentSubjects, truncateDiff } from "./gitDiff";
-import { runClaude } from "./claudeRunner";
+import { LEAN_ARGS, runClaude, toolsArg } from "./claudeRunner";
 import { buildCommitPrompt } from "./promptBuilder";
 import { getGitApi, pickRepository } from "./gitApi";
 import { GIT_REVISION_SCHEME, GitRevisionContentProvider } from "./gitContentProvider";
 import { HubPanel } from "./hubPanel";
+import { PoolPanel } from "./poolPanel";
+import { PROPOSED_SCHEME, ProposedContentProvider } from "./proposedChanges";
 
 export function activate(context: vscode.ExtensionContext) {
+  const proposed = new ProposedContentProvider();
+  PoolPanel.init({ proposed });
+
   context.subscriptions.push(
+    vscode.workspace.registerTextDocumentContentProvider(PROPOSED_SCHEME, proposed),
     vscode.commands.registerCommand("claudeCommit.generate", (arg: unknown) =>
       generateCommitMessage(arg)
     ),
     vscode.commands.registerCommand("claudeCommit.openHub", (arg: unknown) =>
       openHub(context, arg)
     ),
+    vscode.commands.registerCommand("claudeCommit.openHubNewTab", (arg: unknown) =>
+      openHub(context, arg, true)
+    ),
+    vscode.commands.registerCommand("claudeCommit.openPool", (arg: unknown) =>
+      openPool(context, arg)
+    ),
+    vscode.commands.registerCommand("claudeCommit.openPoolNewTab", (arg: unknown) =>
+      openPool(context, arg, true)
+    ),
+    vscode.commands.registerCommand("claudeCommit.saveSelectionToPool", () =>
+      saveSelectionToPool(context)
+    ),
+    vscode.commands.registerCommand("claudeCommit.addSelectionToPoolChat", () =>
+      addSelectionToPoolChat(context)
+    ),
+    vscode.commands.registerCommand("claudeCommit.focusPoolChat", async () => {
+      const root = await resolvePoolRoot(undefined);
+      if (root) {
+        PoolPanel.focus(context, root);
+      }
+    }),
     vscode.workspace.registerTextDocumentContentProvider(
       GIT_REVISION_SCHEME,
       new GitRevisionContentProvider()
@@ -92,7 +119,20 @@ async function generateCommitMessage(arg: unknown) {
         diffStat,
         recentSubjects,
       });
-      const args = ["-p", prompt, "--output-format", "text"];
+      // Writing a commit message is a pure text task: no tools, no agent
+      // system prompt, low effort. ~1k input tokens instead of ~33k.
+      const args = [
+        "-p",
+        prompt,
+        "--output-format",
+        "text",
+        "--system-prompt",
+        "You write accurate, concise git commit messages.",
+        "--effort",
+        "low",
+        ...toolsArg([]),
+        ...LEAN_ARGS,
+      ];
       if (model) {
         args.push("--model", model);
       }
@@ -153,7 +193,7 @@ async function generateCommitMessage(arg: unknown) {
   );
 }
 
-async function openHub(context: vscode.ExtensionContext, arg: unknown) {
+async function openHub(context: vscode.ExtensionContext, arg: unknown, newTab = false) {
   const gitApi = getGitApi();
   if (!gitApi) {
     vscode.window.showErrorMessage(
@@ -162,14 +202,93 @@ async function openHub(context: vscode.ExtensionContext, arg: unknown) {
     return;
   }
 
+  // The "New Tab" title-bar button is invoked from the webview itself (no
+  // useful arg), so default to that tab's own repo instead of re-prompting.
+  const activeCwd = newTab ? HubPanel.activeCwd() : undefined;
+  if (activeCwd) {
+    HubPanel.createNewTab(context, gitApi, activeCwd);
+    return;
+  }
+
   const repository = await pickRepository(gitApi, arg);
   if (!repository) {
     return;
   }
 
-  HubPanel.createOrShow(context, gitApi, repository.rootUri.fsPath);
+  if (newTab) {
+    HubPanel.createNewTab(context, gitApi, repository.rootUri.fsPath);
+  } else {
+    HubPanel.createOrShow(context, gitApi, repository.rootUri.fsPath);
+  }
 }
 
+// The Team Pool is repo-scoped, so resolve which repo first. From the
+// editor title bar VS Code passes the active document's Uri; prefer the
+// repo that contains it over prompting.
+async function resolvePoolRoot(arg: unknown): Promise<string | undefined> {
+  const gitApi = getGitApi();
+  if (!gitApi) {
+    vscode.window.showErrorMessage(
+      "Claude Commit: the built-in Git extension isn't available."
+    );
+    return undefined;
+  }
+  const fileUri =
+    arg instanceof vscode.Uri ? arg : vscode.window.activeTextEditor?.document.uri;
+  if (fileUri?.scheme === "file") {
+    const containing = gitApi.repositories
+      .filter((repo) => fileUri.fsPath.startsWith(repo.rootUri.fsPath))
+      .sort((a, b) => b.rootUri.fsPath.length - a.rootUri.fsPath.length)[0];
+    if (containing) {
+      return containing.rootUri.fsPath;
+    }
+  }
+  const repository = await pickRepository(gitApi, arg);
+  return repository?.rootUri.fsPath;
+}
+
+async function openPool(context: vscode.ExtensionContext, arg: unknown, newTab = false) {
+  // The "New Tab" title-bar button is invoked from the webview itself (no
+  // useful arg), so default to that tab's own repo instead of re-prompting.
+  const activeCwd = newTab ? PoolPanel.activeCwd() : undefined;
+  if (activeCwd) {
+    PoolPanel.createNewTab(context, activeCwd);
+    return;
+  }
+
+  const root = await resolvePoolRoot(arg);
+  if (root) {
+    if (newTab) {
+      PoolPanel.createNewTab(context, root);
+    } else {
+      PoolPanel.createOrShow(context, root);
+    }
+  }
+}
+
+async function saveSelectionToPool(context: vscode.ExtensionContext) {
+  const editor = vscode.window.activeTextEditor;
+  const text = editor?.document.getText(editor.selection);
+  if (!editor || !text?.trim()) {
+    vscode.window.showInformationMessage("Claude Commit: select some text to save to the Team Pool.");
+    return;
+  }
+  const root = await resolvePoolRoot(editor.document.uri);
+  if (root) {
+    await PoolPanel.saveTextFromEditor(context, root, text);
+  }
+}
+
+async function addSelectionToPoolChat(context: vscode.ExtensionContext) {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    return;
+  }
+  const root = await resolvePoolRoot(editor.document.uri);
+  if (root) {
+    PoolPanel.insertReference(context, root, editor);
+  }
+}
 
 function cleanMessage(raw: string): string {
   let message = raw.trim();

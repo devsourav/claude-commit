@@ -5,17 +5,41 @@ export interface DiffResult {
   staged: boolean;
 }
 
+// Generated/vendored files whose diff text costs a lot of tokens and says
+// nothing about intent. They're left out of the diff body but still listed
+// in the --stat summary, so the message can still mention e.g. a
+// dependency bump.
+const NOISY_PATHSPECS = [
+  "package-lock.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+  "Cargo.lock",
+  "poetry.lock",
+  "Gemfile.lock",
+  "composer.lock",
+  "go.sum",
+  "*.min.js",
+  "*.min.css",
+  "*.map",
+  "*.snap",
+].map((p) => `:(exclude,glob)**/${p}`);
+
+// One line of context per hunk instead of git's default three: plenty for
+// summarizing a change, and it shrinks the prompt substantially.
+const DIFF_ARGS = ["diff", "--unified=1", "--no-color"];
+
 // Prefers the staged diff (what will actually be committed). Falls back to
 // the full working-tree diff when nothing is staged, so the command is
 // still useful for someone who hasn't run `git add` yet.
 export async function getDiffToAnalyze(cwd: string): Promise<DiffResult> {
-  const staged = await runGit(cwd, ["diff", "--cached"]);
-  if (staged.trim().length > 0) {
-    return { diff: staged, staged: true };
+  const hasStaged = (await runGit(cwd, ["diff", "--cached", "--name-only"])).trim().length > 0;
+  const scope = hasStaged ? ["--cached"] : [];
+  const diff = await runGit(cwd, [...DIFF_ARGS, ...scope, "--", ".", ...NOISY_PATHSPECS]);
+  if (diff.trim().length > 0) {
+    return { diff, staged: hasStaged };
   }
-
-  const unstaged = await runGit(cwd, ["diff"]);
-  return { diff: unstaged, staged: false };
+  // Only noisy files changed (e.g. a lockfile-only commit): use them after all.
+  return { diff: await runGit(cwd, [...DIFF_ARGS, ...scope]), staged: hasStaged };
 }
 
 // Diffstat summary (files touched, +/- counts) for the same scope as
